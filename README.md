@@ -1,5 +1,7 @@
 <h1 align="center">Atommap</h1>
 
+A convenient, safe, and performant API for atomic file I/O.
+
 ## The better interface for file I/O
 
 The classic UNIX I/O interface: `read()`, `write()`, `seek()`.
@@ -38,10 +40,9 @@ You can freely modify the memory, and only the bits you touch get written back.
 
 So what’s the catch?
 There are a couple (see [below](#other-footguns)),
-but let's starts with the big one:
+but let's start with the big one:
 Other processes can modify the file while you have it mapped,
-and these changes are reflected in the mapping.
-From your perspective, the bytes in your address space have spontenously mutated
+When that happens, the bytes in your address space spontaneously mutate
 without you touching them.
 It's effectively shared/volatile memory.
 rustc assumes that memory doesn’t change unless your code changes it,
@@ -65,6 +66,7 @@ Read more about [O_TMPFILE].
   random fds.  Such behaviour is also [not covered][io safety] by Rust's safety
   guarantees: the tmpfile is an "exclusively owned fd", which "no other code is
   allowed to access in any way".
+
 [O_TMPFILE]: https://man7.org/linux/man-pages/man2/open.2.html#:~:text=O%5FTMPFILE,-%28since
 [io safety]: https://doc.rust-lang.org/nightly/std/io/index.html#io-safety
 
@@ -109,12 +111,43 @@ But if you know that your code will be running exclusively on modern filesystems
 
 ## Putting it together
 
-Essentially we're telling the kernel:
-When I ask for pages, give me the pages that were in the file at this moment in time.
-If anyone changes a page in this file, first make a copy of its original contents and keep it to one side for me -
-that's the version I want.
-When I modify pages, don't merge my changes back into the file immediately; put them to one side as well.
-I'll tell you when to insert them into the file.
+Don't write this:
+
+```rust
+let mut data = std::fs::read("foo.dat")?;
+data.reverse();
+std::fs::write("foo.dat", data)?;
+```
+
+(Runs in ...ms)
+
+Or this:
+
+```rust
+let mut buf = vec![0; 4096];
+let mut file = File::open("foo.dat");
+loop {
+    let n = file.read(&mut buf)?;
+    if n == 0 { break; }
+    buf[..n].reverse();
+    file.seek(SeekFrom::Current(-n))?;
+    file.write(&buf[..n])?;
+}
+```
+
+(Runs in ...ms)
+
+Instead, write this:
+
+```rust
+let mut data = Atommap::open("foo.dat")?;
+data.reverse();
+data.commit()?;
+```
+
+(Runs in ...ms)
+
+TODO: Take measurements for the 3 above.
 
 ## Other footguns
 
