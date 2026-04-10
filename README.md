@@ -1,67 +1,60 @@
 <h1 align="center">Atommap</h1>
 
-A convenient, safe, and performant API for atomic file I/O.
+Safe `mmap()` for Rust, with snapshot isolation and atomic commits.
+(Linux-only, works best on XFS/btrfs.)
 
 ## The better interface for file I/O
 
-The classic UNIX I/O interface: `read()`, `write()`, `seek()`.
+Ah, the classic UNIX I/O interface: `read()`, `write()`, `seek()`.
 It's the perfect interface for operating a magnetic tape.
 
-But these days file I/O is mediated by the page cache[^direct],
-which means these syscalls are not actually performing I/O at all -
-they just modify an in-memory copy of the file.
-The actual I/O happens when synchronising the page cache with the disk.
-This might happen during the call to `read()`/`write()`, or it might be deferred until later, or it might have already happened.
+But these days, whether it's magnetic tape, spinning rust, or NAND,
+you're not really operating the device any more.
+All file I/O is mediated by the page cache[^direct],
+which means these `read()`/`write()` are not actually performing I/O at all -
+they're performing memcpys.
+The actual I/O happens when synchronising the page cache and the disk.
+This _could_ happen during the syscall,
+or it might be deferred until later,
+or it might have already happened.
 
 The natural interface for interacting with the page cache is `mmap()`.
-Instead memcpying between the page cache and a buffer, map the page cache into your address space and operate on it directly.
-Having the whole file mapped into your address space is just so much nicer!
-And it generally performs better to boot - often _much_ better.
+This syscall maps the page cache into your address space
+so you can operate on it directly.
+Copying bytes from the page cache to a buffer and back again is an unnecessary dance
+which complicates your code and makes it slower.
 
-With `read()`/`write()` you have to choose between convenience and performance:
 
-* You could use a small buffer and operate on it one buffer-ful at a time.
-  Efficient but painful!
-  Reading a file via a small buffer is like peeking at it through a peephole.
-  Parsing code grows complexity for dealing with partial buffers.
-  And the optimal buffer size can't be known at compile time:
-  it depends on the system you're running on.
-* You could read the whole file into memory, operate on it, then write the whole thing back again.
-  But if the file is large this wastes I/O bandwidth and memory,
-  especially if you're only interested in a small part of the file.
 
-With `mmap()` you get the best of both worlds:
-it's _as if_ you've read the whole file into memory,
-but data won't _actually_ be read in until you access it.
-Once you stop accessing part of the file,
-the data can be dropped to free up memory -
-it'll be re-loaded from disk if you access it again.
-You can freely modify the memory, and only the bits you touch get written back.
 
-So what’s the catch?
+So what's the catch?
 There are a couple (see [below](#other-footguns)),
 but let's start with the big one:
-Other processes can modify the file while you have it mapped,
-When that happens, the bytes in your address space spontaneously mutate
-without you touching them.
-It's effectively shared/volatile memory.
-rustc assumes that memory doesn’t change unless your code changes it,
-and violating this assumption leads to UB.
-This is why `mmap()` generally requires an `unsafe` block to use from rust.
+Other processes can modify the file while you have it mapped.
+When that happens, the bytes in your address space are updated to reflect the changes[^private].
+All processes which mmap the file share the same memory.
+The upshot: what you get is less `&[u8]` and more `&[AtomicU8]` -
+not looking so convenient any more!
+This is why `mmap()`s which return a `&[u8]` generally require `unsafe`
+and a solemn promise that the file is immutable.
 
 [^direct]: You can skip the page cache using direct I/O, but approximately no-one does that
+[^private]: And setting `MAP_PRIVATE` actually makes it _worse_:
+  changes might not propogate to your mapping for a while, but they will eventually.
+  The result is your mysterious UB is doubly mysterious.
 
 ## Private files can be mmapped safely
 
-In Linux, you can create a file without linking it to the directory tree (ie. a file with no name and no filepath).
+In Linux, you can create a file without linking it to the directory tree (ie. a file with no name).
 No path to the file means other processes can’t open it[^proc],
 and that means the only process which can modify the file is the one that created it.
 If we use the fd to create an mmap _and nothing else_
 then all modifications to the file must be made via the mmap.[^io_safe]
-This solves the "spontaneous mutation" problem.
+This solves the "spontaneous mutation" problem
+and allows us to safely present it as `&mut [u8]`.
 Read more about [O_TMPFILE].
 
-[^proc]: Unless they go snooping in /proc/$pid/fd.  But such adventures aren't covered by Rust's safety guarantees.
+[^proc]: Unless they go snooping in /proc.  But such adventures aren't covered by Rust's safety guarantees.
 [^io_safe]: You might wonder about code in your own process `write()`ing to
   random fds.  Such behaviour is also [not covered][io safety] by Rust's safety
   guarantees: the tmpfile is an "exclusively owned fd", which "no other code is
@@ -111,7 +104,7 @@ But if you know that your code will be running exclusively on modern filesystems
 
 ## Putting it together
 
-Don't write this:
+You could write this:
 
 ```rust
 let mut data = std::fs::read("foo.dat")?;
@@ -163,6 +156,8 @@ mmap is great but it's not perfect.  Here are the drawbacks I'm aware of:
   If you were planning to actually handle this kind of error then SIGBUS will make your life harder.
 1. Unpredictable latency.
   This might be a turn-off for `async` users.
+1. If someone truncates the file and you read beyond the new EOF you get SIGBUS.
+  This crate solves this issue, however.
 
 And here are some drawbacks of the "private clone" trick:
 
