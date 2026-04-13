@@ -1,5 +1,6 @@
-/*! Safe `mmap()` with **snapshot isolation** and **atomic commits**
+/*! **Safe** `mmap()` with **snapshot isolation** and **atomic commits**.
 
+([Linux-only](#os-support), [works best](#performance) on XFS/btrfs.)
 
 ## Example
 
@@ -17,12 +18,59 @@ assert_eq!(std::fs::read_to_string(&path)?, "Hello sekai!");
 # }
 ```
 
+## Safety
+
+The unsafe thing about mmapping a file is that what you get is volatile memory -
+when someone modifies the file, the memory changes.  This is not the way a
+respectable `&[u8]` should behave.
+
+Instead of mapping the file directly, our trick is to map a private "snapshot"
+of the file which doesn't change, even when the file is modified.
+The *only* way to modify the snapshot is via the mmap,
+which makes it a valid `&mut [u8]` according to Rust's rules.
+
+<div class="warning">
+
+There are a few crates out there which expose "safe" `mmap()` without doing
+anything to ensure that the file isn't externally modified.  These are simply
+unsound and should not be used!  If you want to risk UB, that's fine - use
+[`memmap2`](https://crates.io/crates/memmap2) and write the `unsafe` yourself.
+
+</div>
+
+## OS support
+
+We make the snapshot by cloning the original file into an unlinked file.
+It's impossible for anyone else to modify this file, which is what makes it safe to mmap.
+On Linux we use `O_TMPFILE` for this.
+I don't know of a race-free way to create an unlinked file on MacOS/Windows;
+if one exists, please open an issue to let me know!
+
 ## Performance
 
-`Atommap::open()` takes a bit longer than `File::open()` (0.1 ms longer on my
-machine, although this may depend on filesystem; I'm using XFS).  This is a
-one-time cost, and once it's paid there appears to be no performance impact -
-ie. it's the same as `pread()`/`pwrite()`/`mmap()` without snapshot isolation.
+This crate has the same semantics on all filesystems, but wildly different
+performance characteristics.  This table shows whether methods are constant-time
+(✅) or linear-time (⏳️) in the size of the file:
+
+Method | XFS | btrfs | ext4
+-------|-----|-------|---------
+[`open()`][`Mmap::open`]                         | ✅ | ✅ | ⏳️
+[`commit()`][`Mmap::commit`]                     | ✅ | ✅ | ⏳️
+[`commit_and_close()`][`Mmap::commit_and_close`] | ✅ | ✅ | ✅
+
+See the method docs for more details.
+
+Although many distros now default to reflink-capable filesystems for new
+installs[^debian], it will obviously be common to encounter ext4 in the wild for
+many years to come.  Be aware that a subset of your users may experience stalls
+when mmapping large files.
+
+[^debian]: The major exceptions are Debian and Ubuntu, which select ext4 by
+    default in the installer.  This is, frankly, a bad decision on their part.
+    From its creation, ext4 was intended as a "stop-gap" to give people more
+    time to migrate away from the ext* family of filesystems.  It shouldn't be
+    used for fresh installs.
+
 */
 
 use rustix::{
